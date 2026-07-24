@@ -1,0 +1,509 @@
+---
+name: "Build & Release"
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+  packages: write
+  pages: write
+  id-token: write
+
+jobs:
+  build-deb:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - codename: bookworm
+            arch: amd64
+            docker_platform: linux/amd64
+          - codename: bookworm
+            arch: arm64
+            docker_platform: linux/arm64
+          - codename: bookworm
+            arch: armhf
+            docker_platform: linux/arm/v7
+          - codename: trixie
+            arch: amd64
+            docker_platform: linux/amd64
+          - codename: trixie
+            arch: arm64
+            docker_platform: linux/arm64
+          - codename: trixie
+            arch: armhf
+            docker_platform: linux/arm/v7
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Extract version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build .deb package
+        run: |
+          docker run --rm --platform ${{ matrix.docker_platform }} \
+            -v "$PWD":/src -w /src \
+            debian:${{ matrix.codename }} bash -c '
+              set -e
+              export DEBIAN_FRONTEND=noninteractive
+
+              apt-get update
+              apt-get install -y --no-install-recommends \
+                build-essential curl debhelper dh-virtualenv dpkg-dev \
+                git libffi-dev libssl-dev libxml2-dev libxslt-dev \
+                nodejs npm pkg-config python3 python3-dev python3-pip \
+                python3-venv python3-virtualenv zlib1g-dev
+
+              # Install Poetry
+              curl -sSL https://install.python-poetry.org | python3 -
+              export PATH="/root/.local/bin:$PATH"
+
+              # Update version from git tag
+              VERSION='"${{ steps.version.outputs.version }}"'
+              CODENAME='"${{ matrix.codename }}"'
+              poetry version "$VERSION"
+              # Distinct Debian revisions per codename so reprepro pool paths do not
+              # collide (bookworm vs trixie produce different .deb contents).
+              sed -i "1s/([^)]*)/(${VERSION}-1+${CODENAME})/" dist/debian/changelog
+
+              # Build frontend
+              cd frontend && npm install && npm run build && cd ..
+
+              # Build Python sdist (used by dh-virtualenv)
+              poetry build
+
+              # Build .deb (dpkg-buildpackage runs from dist/ where debian/ lives,
+              # and produces .deb files one directory up in /src)
+              export DEB_BUILD_OPTIONS=noautodbgsym
+              cd dist && dpkg-buildpackage -us -uc -b && cd ..
+
+              # Collect output
+              mkdir -p output
+              cp /src/*.deb output/ 2>/dev/null || cp /*.deb output/ 2>/dev/null
+              test -n "$(ls output/*.deb 2>/dev/null)" || { echo "ERROR: No .deb files produced"; exit 1; }
+              # Fail fast if .deb architecture does not match the build (avoids wrong APT metadata)
+              EXPECT_ARCH=${{ matrix.arch }}
+              for f in output/*.deb; do
+                DEB_ARCH=$(dpkg-deb -f "$f" Architecture)
+                if [ "$DEB_ARCH" != "$EXPECT_ARCH" ]; then
+                  echo "ERROR: $f has Architecture=$DEB_ARCH, expected $EXPECT_ARCH"
+                  exit 1
+                fi
+              done
+              echo "Depends/Pre-Depends (sanity check):"
+              dpkg-deb -f output/mariner3d_*.deb Pre-Depends Depends || true
+            '
+
+      - name: Upload .deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.codename }}-${{ matrix.arch }}
+          path: output/*.deb
+
+  build-rpm:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            docker_platform: linux/amd64
+          - arch: aarch64
+            docker_platform: linux/arm64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Extract version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build .rpm package
+        run: |
+          docker run --rm --platform ${{ matrix.docker_platform }} \
+            -v "$PWD":/build -w /build \
+            fedora:41 bash -c '
+              set -e
+              VERSION='"${{ steps.version.outputs.version }}"'
+
+              dnf install -y \
+                gcc make python3-devel python3-pip python3-setuptools \
+                libffi-devel openssl-devel libxml2-devel libxslt-devel \
+                zlib-devel rpm-build systemd-rpm-macros nodejs npm curl git
+
+              # Install Poetry
+              curl -sSL https://install.python-poetry.org | python3 -
+              export PATH="/root/.local/bin:$PATH"
+
+              # Update version and build sdist
+              poetry version "$VERSION"
+              poetry build
+
+              # Build frontend
+              cd frontend && npm install && npm run build && cd ..
+
+              # Create rpmbuild structure
+              mkdir -p /root/rpmbuild/{SOURCES,SPECS}
+              cp dist/mariner-${VERSION}.tar.gz /root/rpmbuild/SOURCES/
+              cp dist/rpm/mariner3d.spec /root/rpmbuild/SPECS/
+
+              # Build RPM
+              rpmbuild -bb \
+                --define "_version ${VERSION}" \
+                /root/rpmbuild/SPECS/mariner3d.spec
+
+              mkdir -p /build/output
+              cp /root/rpmbuild/RPMS/*/*.rpm /build/output/
+            '
+
+      - name: Upload .rpm artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpm-${{ matrix.arch }}
+          path: output/*.rpm
+
+  build-container:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Extract version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Generate Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            amd989/mariner3d
+            ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=latest
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push multi-platform image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  release:
+    needs: [build-deb, build-rpm, build-container]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "{deb-*,rpm-*}"
+          path: packages-raw
+          merge-multiple: false
+
+      - name: Flatten packages for release (unique .deb names per codename)
+        run: |
+          set -e
+          mkdir -p packages
+          shopt -s nullglob
+          rpms=(packages-raw/rpm-*/*.rpm)
+          debs=(packages-raw/deb-*/*.deb)
+          if [ "${#debs[@]}" -eq 0 ]; then
+            echo "ERROR: no .deb under packages-raw/deb-*" >&2
+            ls -laR packages-raw || true
+            exit 1
+          fi
+          for rpm in "${rpms[@]}"; do
+            [ -f "$rpm" ] && cp "$rpm" packages/
+          done
+          for deb in "${debs[@]}"; do
+            artifact_dir=$(basename "$(dirname "$deb")")
+            cp "$deb" "packages/${artifact_dir}_$(basename "$deb")"
+          done
+          ls -la packages
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            packages/*.deb
+            packages/*.rpm
+          generate_release_notes: true
+
+  publish-repos:
+    needs: [build-deb, build-rpm]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout gh-pages
+        uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+          fetch-depth: 0
+        continue-on-error: true
+
+      - name: Initialize gh-pages if needed
+        run: |
+          if [ ! -f index.html ]; then
+            git init
+            git checkout -b gh-pages
+          fi
+
+      - name: Download deb artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: deb-*
+          path: incoming-deb
+          merge-multiple: false
+
+      - name: Download rpm artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: rpm-*
+          path: incoming-rpm
+          merge-multiple: true
+
+      - name: Install repo tools
+        run: sudo apt-get update && sudo apt-get install -y reprepro createrepo-c
+
+      - name: Import or generate GPG key
+        run: |
+          if [ -n "${{ secrets.GPG_PRIVATE_KEY }}" ]; then
+            echo "${{ secrets.GPG_PRIVATE_KEY }}" | gpg --batch --import
+            GPG_KEY_ID=$(gpg --list-secret-keys --keyid-format long | grep sec | head -1 | awk '{print $2}' | cut -d'/' -f2)
+          else
+            cat > /tmp/gpg-batch <<GPGEOF
+              %no-protection
+              Key-Type: RSA
+              Key-Length: 4096
+              Subkey-Type: RSA
+              Subkey-Length: 4096
+              Name-Real: mariner3d
+              Name-Email: amd989@users.noreply.github.com
+              Expire-Date: 0
+          GPGEOF
+            gpg --batch --gen-key /tmp/gpg-batch
+            GPG_KEY_ID=$(gpg --list-secret-keys --keyid-format long | grep sec | head -1 | awk '{print $2}' | cut -d'/' -f2)
+            echo "::warning::Using auto-generated GPG key. For production, add GPG_PRIVATE_KEY secret."
+          fi
+          echo "GPG_KEY_ID=$GPG_KEY_ID" >> "$GITHUB_ENV"
+          gpg --armor --export "$GPG_KEY_ID" > gpg.key
+
+      - name: Configure reprepro
+        run: |
+          mkdir -p conf
+          cat > conf/distributions <<EOF
+          Origin: mariner3d
+          Label: mariner3d
+          Codename: bookworm
+          Architectures: amd64 arm64 armhf
+          Components: main
+          Description: Mariner 2 - MSLA 3D Printer Controller (Debian bookworm)
+          SignWith: ${{ env.GPG_KEY_ID }}
+
+          Origin: mariner3d
+          Label: mariner3d
+          Codename: trixie
+          Architectures: amd64 arm64 armhf
+          Components: main
+          Description: Mariner 2 - MSLA 3D Printer Controller (Debian trixie)
+          SignWith: ${{ env.GPG_KEY_ID }}
+
+          Origin: mariner3d
+          Label: mariner3d
+          Codename: stable
+          Architectures: amd64 arm64 armhf
+          Components: main
+          Description: Mariner 2 - legacy APT suite (same packages as bookworm; use bookworm or trixie for new installs)
+          SignWith: ${{ env.GPG_KEY_ID }}
+          EOF
+
+      - name: Add deb packages to APT repo
+        run: |
+          set -e
+          shopt -s nullglob
+          debdirs=(incoming-deb/deb-*)
+          if [ "${#debdirs[@]}" -eq 0 ]; then
+            echo "ERROR: no directories matching incoming-deb/deb-* (expected per-matrix deb artifacts)" >&2
+            ls -la incoming-deb || true
+            exit 1
+          fi
+          for debdir in "${debdirs[@]}"; do
+            [ -d "$debdir" ] || continue
+            base=$(basename "$debdir")
+            rest="${base#deb-}"
+            arch="${rest##*-}"
+            codename="${rest%-$arch}"
+            case "$codename" in bookworm|trixie) ;; *)
+              echo "ERROR: unexpected artifact directory name: $base (expected deb-<codename>-<arch>)" >&2
+              exit 1
+            ;; esac
+            # Only the main binary package (omit *dbgsym* and any other derived .deb).
+            for deb in "$debdir"/mariner3d_*.deb; do
+              [ -f "$deb" ] || continue
+              echo "Including $deb into suite $codename"
+              reprepro includedeb "$codename" "$deb"
+              if [ "$codename" = bookworm ]; then
+                echo "Including $deb into suite stable (bookworm-compatible legacy alias)"
+                reprepro includedeb stable "$deb"
+              fi
+            done
+          done
+
+      - name: Verify APT repo layout
+        run: |
+          set -e
+          for codename in bookworm trixie stable; do
+            for arch in amd64 arm64 armhf; do
+              pkg="dists/${codename}/main/binary-${arch}/Packages"
+              test -f "$pkg" || { echo "ERROR: missing $pkg"; exit 1; }
+              grep -q '^Package: mariner3d$' "$pkg" || { echo "ERROR: mariner3d not listed in $pkg"; exit 1; }
+            done
+          done
+          echo "APT layout OK: bookworm, trixie, stable (bookworm alias), all architectures."
+
+      - name: Create YUM/DNF repo
+        run: |
+          rm -rf rpm/packages rpm/repodata
+          mkdir -p rpm/packages
+          cp incoming-rpm/*.rpm rpm/packages/
+          gpg --batch --pinentry-mode loopback --detach-sign --armor rpm/packages/*.rpm 2>/dev/null || true
+          createrepo_c rpm/
+          gpg --batch --pinentry-mode loopback --detach-sign --armor rpm/repodata/repomd.xml
+
+      - name: Fetch index page from source
+        run: |
+          curl -fsSL "https://raw.githubusercontent.com/amd989/mariner/${GITHUB_REF_NAME}/gh-pages/index.html" -o index.html
+          sed -i "s/{{VERSION}}/${GITHUB_REF_NAME#v}/g" index.html
+
+      - name: Create APT setup script
+        run: |
+          cat > setup-apt.sh <<'EOF'
+          #!/bin/bash
+          # Run as root (e.g. curl ... | sudo bash /dev/stdin --prefer-armhf)
+          set -e
+          PREFER_ARMHF=
+          for arg in "$@"; do
+            case "$arg" in
+              --prefer-armhf) PREFER_ARMHF=1 ;;
+            esac
+          done
+
+          if [ -r /etc/os-release ]; then
+            # shellcheck source=/dev/null
+            . /etc/os-release
+          fi
+          CODENAME="${VERSION_CODENAME:-}"
+          case "$CODENAME" in
+            bookworm|trixie) ;;
+            "")
+              echo "ERROR: VERSION_CODENAME is empty. Is this a Debian-based system with /etc/os-release?" >&2
+              exit 1
+              ;;
+            *)
+              echo "ERROR: Unsupported Debian suite '${CODENAME}'. Supported: bookworm, trixie." >&2
+              exit 1
+              ;;
+          esac
+
+          echo "Adding Mariner 2 APT repository (suite: ${CODENAME})..."
+          curl -fsSL https://amd989.github.io/mariner/gpg.key | gpg --dearmor -o /usr/share/keyrings/mariner3d.gpg
+          echo "deb [signed-by=/usr/share/keyrings/mariner3d.gpg] https://amd989.github.io/mariner ${CODENAME} main" > /etc/apt/sources.list.d/mariner3d.list
+
+          if [ -n "$PREFER_ARMHF" ]; then
+            native_arch=$(dpkg --print-architecture)
+            if [ "$native_arch" = arm64 ] && ! dpkg --print-foreign-architectures 2>/dev/null | grep -qx armhf; then
+              echo "Warning: native arch is arm64 but armhf multiarch is not enabled. Install may fail until you run:" >&2
+              echo "  sudo dpkg --add-architecture armhf && sudo apt-get update" >&2
+            fi
+            echo "Writing apt preferences so mariner3d resolves to armhf (not native arm64) when both are available..."
+            printf '%s\n' \
+              "Explanation: Prefer mariner3d armhf over arm64 on multiarch ARM systems" \
+              "Package: mariner3d:arm64" \
+              "Pin: version *" \
+              "Pin-Priority: -1" \
+              > /etc/apt/preferences.d/mariner3d-prefer-armhf
+          fi
+
+          apt-get update
+          echo ""
+          echo "Done."
+          echo "  Install:  sudo apt install mariner3d"
+          echo "On 64-bit ARM with armhf multiarch, apt defaults to the native arch (arm64). To force armhf:"
+          echo "  sudo apt install mariner3d:armhf"
+          echo "  or re-run this script with --prefer-armhf (writes /etc/apt/preferences.d/mariner3d-prefer-armhf)."
+          EOF
+          chmod +x setup-apt.sh
+          cp setup-apt.sh setup.sh
+
+      - name: Create DNF setup script
+        run: |
+          cat > setup-rpm.sh <<'EOF'
+          #!/bin/bash
+          set -e
+          echo "Adding Mariner 2 YUM/DNF repository..."
+          rpm --import https://amd989.github.io/mariner/gpg.key
+          cat > /etc/yum.repos.d/mariner3d.repo <<REPOEOF
+          [mariner3d]
+          name=Mariner 2 - MSLA 3D Printer Controller
+          baseurl=https://amd989.github.io/mariner/rpm/
+          enabled=1
+          gpgcheck=1
+          gpgkey=https://amd989.github.io/mariner/gpg.key
+          REPOEOF
+          echo "Done! Run: sudo dnf install mariner3d"
+          EOF
+          chmod +x setup-rpm.sh
+
+      - name: Deploy to GitHub Pages
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          rm -rf incoming-deb incoming-rpm conf
+          git add -A
+          git commit -m "Update package repos for ${GITHUB_REF_NAME}" || true
+          git push origin gh-pages --force
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

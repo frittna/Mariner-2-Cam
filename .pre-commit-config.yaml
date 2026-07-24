@@ -1,0 +1,51 @@
+---
+repos:
+  - repo: local
+    hooks:
+      # Fast checks run on every commit.
+      - id: black
+        name: black
+        entry: poetry run black --check .
+        language: system
+        stages: [pre-commit]
+        pass_filenames: false
+      - id: flake8
+        name: flake8
+        entry: poetry run flake8
+        language: system
+        stages: [pre-commit]
+        pass_filenames: false
+      # pyre: no Windows binary ships — runs in CI only.
+      - id: eslint
+        name: eslint
+        entry: npm --prefix frontend run lint
+        language: system
+        stages: [pre-commit]
+        pass_filenames: false
+      - id: prettier
+        name: prettier
+        entry: npx --prefix frontend prettier --check frontend/src
+        language: system
+        stages: [pre-commit]
+        pass_filenames: false
+      - id: tsc
+        name: tsc
+        entry: npx --prefix frontend tsc -p frontend
+        language: system
+        stages: [pre-commit]
+        pass_filenames: false
+
+      # Slow checks run on push only — CI still guards merges.
+      # green: api.py uses os.sync() which is Unix-only — runs in CI only.
+      - id: vitest
+        name: vitest
+        entry: npm --prefix frontend test
+        language: system
+        stages: [pre-push]
+        pass_filenames: false
+      - id: build
+        name: build
+        entry: npm --prefix frontend run build
+        language: system
+        stages: [pre-push]
+        pass_filenames: false
